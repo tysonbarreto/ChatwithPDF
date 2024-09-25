@@ -1,0 +1,12 @@
+langchain
+langchain_community
+langchain_text_splitters
+langchain_huggingface
+langchain_chroma
+streamlit
+transformers
+torch
+accelerate
+pypdf
+sentence_transformers
+chromadb==0.3.22
