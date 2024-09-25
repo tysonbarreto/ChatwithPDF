@@ -1,44 +1,68 @@
 import streamlit as st
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, PreTrainedTokenizer, PreTrainedModel
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from transformers import pipeline
 import torch
 import base64
 import textwrap
+from langchain_community.document_loaders import PDFMinerLoader, PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores.chroma import Chroma
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_huggingface.llms import HuggingFacePipeline
 from langchain.chains.retrieval_qa.base import RetrievalQA
 from constants import CHROMA_SETTINGS
+from streamlit_chat import message
+from streamlit_pdf_viewer import pdf_viewer
+import os
 
-checkpoint = 'MBZUAI/LaMini-T5-223M'
+checkpoint = 'MBZUAI/LaMini-T5-61M'
+
+st.set_page_config(layout="wide")
+
+device = torch.device('cpu')
 
 @st.cache_resource
-def load_lokenizer(checkpoint)->PreTrainedTokenizer:
+def load_models():
+    checkpoint = "MBZUAI/LaMini-T5-738M"
+    print(f"Checkpoint path: {checkpoint}")  # Add this line for debugging
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-    print("Loaded Tokenizer!")
-    return tokenizer
-    
+    base_model = AutoModelForSeq2SeqLM.from_pretrained(
+        checkpoint,
+        device_map=device,
+        torch_dtype=torch.float32
+)
+    return tokenizer, base_model
+tokenizer, base_model = load_models()
+
+persist_directory = "db"
 
 @st.cache_resource
-def load_model(checkpoint)->PreTrainedModel:
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        checkpoint,
-        device_map="auto",
-        torch_dtype=torch.float32)
-    print("Loaded Model!")
-    return model
-
+def data_ingestion():
+    for root, dirs, files in os.walk("docs"):
+        for file in files:
+            if file.endswith(".pdf"):
+                print(file)
+                loader = PyPDFLoader(os.path.join(root, file))
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=500)
+    texts = text_splitter.split_documents(documents)
+    #create embeddings here
+    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+    #create vector store here
+    db = Chroma.from_documents(texts, embeddings, persist_directory=persist_directory, client_settings=CHROMA_SETTINGS)
+    db.persist()
+    db=None 
 
 @st.cache_resource
 def llm_pipeline():
     pipe = pipeline(
         'text2text-generation',
-        model=load_model,
-        tokenizer=load_lokenizer,
-        max_length=256,
-        do_sample=True,
-        temperature=0.3,
-        top_p=0.95
+        model = base_model,
+        tokenizer = tokenizer,
+        max_length = 256,
+        do_sample = True,
+        temperature = 0.3,
+        top_p= 0.95
     )
     local_llm = HuggingFacePipeline(pipeline=pipe)
     return local_llm
@@ -46,38 +70,101 @@ def llm_pipeline():
 @st.cache_resource
 def qa_llm():
     llm = llm_pipeline()
-    embeddings = HuggingFaceEmbeddings(model_name = 'all-MiniLM-L6-v2')
-    db = Chroma(persist_directory="db", embedding_function=embeddings, client_settings=CHROMA_SETTINGS)
+    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+    db = Chroma(persist_directory="db", embedding_function = embeddings, client_settings=CHROMA_SETTINGS)
     retriever = db.as_retriever()
     qa = RetrievalQA.from_chain_type(
         llm = llm,
-        chain_type="stuff",
+        chain_type = "stuff",
         retriever = retriever,
-        return_source_document = True
+        return_source_documents=True
     )
     return qa
-    
+
 def process_answer(instruction):
-    response=""
+    response = ''
+    instruction = instruction
     qa = qa_llm()
     generated_text = qa(instruction)
     answer = generated_text['result']
-    return answer, generated_text
+    return answer
+
+def get_file_size(file):
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+    return file_size
+
+@st.cache_data
+#function to display the PDF of a given file 
+def displayPDF(file):
+    # Opening file from file path
+    with open(file, "rb") as f:
+        base64_pdf = base64.b64encode(f.read()).decode('utf-8')
+
+    # Embedding PDF in HTML
+    pdf_display = F'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
+
+    # Displaying File
+    st.markdown(pdf_display, unsafe_allow_html=True)
+
+# Display conversation history using Streamlit messages
+def display_conversation(history):
+    for i in range(len(history["generated"])):
+        message(history["past"][i], is_user=True, key=str(i) + "_user")
+        message(history["generated"][i],key=str(i))
 
 def main():
-    st.title("Search your PDF")
-    with st.expander("About the App"):
-        st.markdown(
-            "Generative AI powered Q&A chat with your PDF"
-        )
-    
-    question =st.text_area("Your Question")
-    if st.button("Search"):
-        st.info("Your question: "+ question)
-        st.info("Your Answer")
-        answer, metadata = process_answer(question)
-        st.write(answer)
-        st.write(metadata)
-        
+    st.markdown("<h1 style='text-align: center; color: green;'>Chat with your PDF</h1>", unsafe_allow_html=True)
+
+    st.markdown("<h2 style='text-align: center; color:red;'>Upload your PDF 👇</h2>", unsafe_allow_html=True)
+
+    uploaded_file = st.file_uploader("", type=["pdf"])
+
+    if uploaded_file is not None:
+        file_details = {
+            "Filename": uploaded_file.name,
+            "File size": f"{get_file_size(uploaded_file)/1000000:.2f} MB"
+        }
+        filepath = "docs/"+uploaded_file.name
+        with open(filepath, "wb") as temp_file:
+                temp_file.write(uploaded_file.read())
+
+        col1, col2= st.columns([1,2])
+        with col1:
+            st.markdown("<h4 style color:black;'>File details</h4>", unsafe_allow_html=True)
+            st.json(file_details)
+            st.markdown("<h4 style color:black;'>File preview</h4>", unsafe_allow_html=True)
+            
+            binary_data = uploaded_file.getvalue()
+            pdf_viewer(input=binary_data, width=700)
+
+        with col2:
+            with st.spinner('Embeddings are in process...'):
+                ingested_data = data_ingestion()
+            st.success('Embeddings are created successfully!')
+            st.markdown("<h4 style color:black;'>Chat Here</h4>", unsafe_allow_html=True)
+
+
+            user_input = st.text_input("", key="input")
+
+            # Initialize session state for generated responses and past messages
+            if "generated" not in st.session_state:
+                st.session_state["generated"] = ["I am ready to help you"]
+            if "past" not in st.session_state:
+                st.session_state["past"] = ["Hey there!"]
+                
+            # Search the database for a response based on user input and update session state
+            if user_input:
+                answer = process_answer({'query': user_input})
+                st.session_state["past"].append(user_input)
+                response = answer
+                st.session_state["generated"].append(response)
+
+            # Display conversation history using Streamlit messages
+            if st.session_state["generated"]:
+                display_conversation(st.session_state)
+                
+
 if __name__ == "__main__":
     main()
